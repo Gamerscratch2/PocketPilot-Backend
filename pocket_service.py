@@ -1,0 +1,298 @@
+import asyncio
+import re
+import time
+from datetime import datetime, timezone
+
+from config import (ok as _ok, err as _err, get_fernet, SESSION_FILE,
+                    CURATED_ASSETS, APP_VERSION, tf_to_seconds, SERVICE_NAME)
+
+
+def _norm_candle(c):
+    try:
+        return {
+            "timestamp": c.get("time"),
+            "time": c.get("time"),
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"]),
+            "volume": c.get("volume"),
+        }
+    except Exception:
+        return None
+
+
+class PocketService:
+    def __init__(self):
+        self.client = None
+        self.ssid = None
+        self.is_demo = False
+        self.connected = False
+        self.balance = None
+        self.currency = "USD"
+        self.last_error = None
+        self.reconnect_count = 0
+        self.last_validated = None
+        self._lock = asyncio.Lock()
+
+    # ---------- SSID / encryption ----------
+    def _parse_is_demo(self, ssid):
+        m = re.search(r'"is_?[Dd]emo"s*:s*(d)', ssid or "")
+        return bool(m and m.group(1) == "1")
+
+    def _load_stored_ssid(self):
+        if SESSION_FILE.exists():
+            try:
+                return get_fernet().decrypt(SESSION_FILE.read_bytes()).decode()
+            except Exception:
+                return None
+        return None
+
+    def _store_ssid(self, ssid):
+        try:
+            get_fernet().encrypt(ssid.encode())  # validate key works
+            SESSION_FILE.write_bytes(get_fernet().encrypt(ssid.encode()))
+        except Exception as e:
+            self.last_error = f"échec chiffrement SSID: {e}"
+
+    def _clear_stored(self):
+        try:
+            if SESSION_FILE.exists():
+                SESSION_FILE.unlink()
+        except Exception:
+            pass
+
+    # ---------- connection ----------
+    async def _make_client(self, ssid):
+        from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+        return PocketOptionAsync(ssid=ssid)
+
+    async def connect(self, ssid):
+        async with self._lock:
+            if not ssid or '"auth"' not in (ssid or ""):
+                return _err("BAD_SSID", 'SSID invalide — format attendu: 42["auth",{"session":...,"isDemo":1,...}]')
+            if not self._parse_is_demo(ssid):
+                return _err("REAL_ACCOUNT_BLOCKED", "Compte réel détecté. PocketPilot n'accepte que les comptes DEMO.", 403)
+            try:
+                client = await self._make_client(ssid)
+                bal = await asyncio.wait_for(client.balance(), timeout=25)
+                self.client = client
+                self.ssid = ssid
+                self.is_demo = True
+                self.connected = True
+                self.balance = float(bal) if bal is not None else None
+                self.last_error = None
+                self.last_validated = datetime.now(timezone.utc).isoformat()
+                self.reconnect_count = 0
+                self._store_ssid(ssid)
+                return _ok({"isDemo": True, "balance": self.balance, "currency": self.currency,
+                            "accountType": "DEMO", "connected": True,
+                            "lastValidatedAt": self.last_validated})
+            except Exception as e:
+                self.connected = False
+                self.last_error = str(e)
+                return _err("CONNECT_FAILED", f"Échec de connexion Pocket Option: {e}", 502)
+
+    async def validate(self):
+        if not self.client:
+            return _err("NOT_CONNECTED", "Aucune session active.", 409)
+        try:
+            t0 = time.time()
+            bal = await asyncio.wait_for(self.client.balance(), timeout=20)
+            self.balance = float(bal) if bal is not None else None
+            self.connected = True
+            self.last_validated = datetime.now(timezone.utc).isoformat()
+            return _ok({"isDemo": True, "balance": self.balance,
+                        "latencyMs": int((time.time() - t0) * 1000)})
+        except Exception as e:
+            self.connected = False
+            self.last_error = str(e)
+            return _err("VALIDATE_FAILED", str(e), 502)
+
+    async def reconnect(self):
+        ssid = self.ssid or self._load_stored_ssid()
+        if not ssid:
+            return _err("NO_STORED_SSID", "Aucun SSID stocké pour la reconnexion.", 409)
+        self.reconnect_count += 1
+        return await self.connect(ssid)
+
+    async def disconnect(self):
+        async with self._lock:
+            self.connected = False
+            self.client = None
+            self.ssid = None
+            self.balance = None
+            self._clear_stored()
+            return _ok({"connected": False})
+
+    # ---------- status ----------
+    async def status(self):
+        latency = None
+        if self.connected and self.client:
+            try:
+                t0 = time.time()
+                bal = await asyncio.wait_for(self.client.balance(), timeout=15)
+                self.balance = float(bal) if bal is not None else None
+                latency = int((time.time() - t0) * 1000)
+                self.last_validated = datetime.now(timezone.utc).isoformat()
+            except Exception as e:
+                self.connected = False
+                self.last_error = str(e)
+        return _ok({
+            "connected": self.connected,
+            "isDemo": self.is_demo if self.connected else False,
+            "balance": self.balance,
+            "currency": self.currency,
+            "accountType": "DEMO" if self.is_demo else "UNKNOWN",
+            "serverTime": datetime.now(timezone.utc).isoformat(),
+            "latencyMs": latency,
+            "lastValidatedAt": self.last_validated,
+            "lastError": self.last_error,
+            "reconnectCount": self.reconnect_count,
+        })
+
+    # ---------- market data ----------
+    async def get_candles(self, asset, timeframe, amount=100):
+        if not self.connected or not self.client:
+            return _err("NOT_CONNECTED", "Session Pocket Option non connectée.", 409)
+        period = tf_to_seconds(timeframe)
+        amount = max(10, min(int(amount or 100), 500))
+        hours = max(0.2, (amount * period) / 3600 * 1.6 + 0.1)
+        try:
+            agen = self.client.get_candles_live(asset, period=period, hours=hours, max_rows=amount)
+            try:
+                closed, _forming = await asyncio.wait_for(agen.__anext__(), timeout=25)
+            finally:
+                await agen.aclose()
+            candles = [c for c in (_norm_candle(c) for c in (closed or [])) if c]
+            candles = candles[-amount:]
+            if not candles:
+                return _err("NO_CANDLES", "Aucun chandelier reçu de Pocket Option.", 502)
+            return _ok({"candles": candles, "asset": asset, "timeframe": timeframe})
+        except asyncio.TimeoutError:
+            return _err("CANDLES_TIMEOUT", "Délai dépassé pour la réception des chandeliers.", 504)
+        except Exception as e:
+            self.last_error = str(e)
+            return _err("CANDLES_FAILED", str(e), 502)
+
+    async def get_assets(self):
+        assets = []
+        if self.connected and self.client:
+            for method in ("get_assets", "assets"):
+                fn = getattr(self.client, method, None)
+                if fn:
+                    try:
+                        res = await asyncio.wait_for(fn(), timeout=20) if asyncio.iscoroutinefunction(fn) else fn()
+                        if isinstance(res, dict):
+                            for name, info in res.items():
+                                info = info or {}
+                                assets.append({"name": name, "symbol": name,
+                                               "open": bool(info.get("open", info.get("enabled", True))),
+                                               "payout": info.get("payout"),
+                                               "price": info.get("price")})
+                            break
+                        elif isinstance(res, list):
+                            for a in res:
+                                name = a.get("name") or a.get("symbol") if isinstance(a, dict) else str(a)
+                                assets.append({"name": name, "symbol": name,
+                                               "open": True, "payout": None, "price": None})
+                            break
+                    except Exception:
+                        assets = []
+        if not assets:
+            assets = [{"name": a, "symbol": a, "open": True, "payout": None, "price": None}
+                      for a in CURATED_ASSETS]
+        return _ok(assets)
+
+    async def get_server_time(self):
+        return _ok({"serverTime": datetime.now(timezone.utc).isoformat(),
+                    "utcTime": datetime.now(timezone.utc).isoformat()})
+
+    # ---------- trading ----------
+    async def trade_manual(self, asset, direction, amount, duration):
+        if not self.connected or not self.client:
+            return _err("NOT_CONNECTED", "Session non connectée — trade refusé.", 409)
+        if not self.is_demo:
+            return _err("REAL_ACCOUNT_BLOCKED", "Compte réel détecté — trade bloqué.", 403)
+        direction = (direction or "").upper()
+        if direction not in ("CALL", "PUT"):
+            return _err("BAD_DIRECTION", "direction doit être CALL ou PUT.", 400)
+        try:
+            amount = float(amount)
+            duration = int(duration or 60)
+            if direction == "CALL":
+                tid, deal = await asyncio.wait_for(
+                    self.client.buy(asset=asset, amount=amount, time=duration), timeout=20)
+            else:
+                tid, deal = await asyncio.wait_for(
+                    self.client.sell(asset=asset, amount=amount, time=duration), timeout=20)
+            deal = deal or {}
+            entry_price = None
+            for k in ("price", "open_price", "entry_price", "strike"):
+                if deal.get(k) is not None:
+                    entry_price = deal.get(k)
+                    break
+            return _ok({"trade": {
+                "id": str(tid),
+                "asset": asset, "direction": direction,
+                "amount": amount, "duration": duration,
+                "entryPrice": entry_price,
+                "openedAt": datetime.now(timezone.utc).isoformat(),
+                "status": "OPEN",
+            }})
+        except Exception as e:
+            self.last_error = str(e)
+            return _err("TRADE_FAILED", str(e), 502)
+
+    # ---------- system ----------
+    async def system_check(self):
+        comps = []
+        ready = True
+        # Python
+        import sys
+        comps.append({"name": "Python", "ok": True, "detail": sys.version.split()[0]})
+        # BinaryOptionsToolsV2
+        try:
+            import BinaryOptionsToolsV2  # noqa
+            comps.append({"name": "BinaryOptionsToolsV2", "ok": True, "detail": "installé"})
+        except Exception as e:
+            comps.append({"name": "BinaryOptionsToolsV2", "ok": False, "detail": str(e)})
+            ready = False
+        # Playwright (optional)
+        try:
+            import playwright  # noqa
+            comps.append({"name": "Playwright", "ok": True, "detail": "installé (login navigateur possible)"})
+        except Exception:
+            comps.append({"name": "Playwright", "ok": False, "detail": "non installé (login navigateur désactivé — utilisez le SSID)"})
+        # Session
+        comps.append({"name": "Session Pocket Option", "ok": self.connected,
+                      "detail": "connecté" if self.connected else "non connecté"})
+        # Encryption
+        try:
+            get_fernet()
+            comps.append({"name": "Chiffrement SSID", "ok": True, "detail": "clé disponible"})
+        except Exception as e:
+            comps.append({"name": "Chiffrement SSID", "ok": False, "detail": str(e)})
+            ready = False
+        return _ok({"ready": ready and self.connected, "components": comps,
+                    "demoOnly": True, "version": APP_VERSION})
+
+    # ---------- login browser (optional, Playwright) ----------
+    async def login_browser(self, email, password, demo=True):
+        try:
+            from playwright.async_api import async_playwright
+        except Exception:
+            return _err("PLAYWRIGHT_MISSING",
+                        "Login navigateur indisponible sur ce déploiement. Utilisez votre SSID Pocket Option (DevTools > Network > WS > 42[\"auth\",...]).", 501)
+        if not email or not password:
+            return _err("BAD_CREDENTIALS", "email et password requis.", 400)
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto("https://pocketoption.com/", timeout=60000)
+                await browser.close()
+            return _err("LOGIN_BROWSER_UNSTABLE",
+                        "L'automatisation de login est instable. Préférez la connexion par SSID.", 501)
+        except Exception as e:
+            return _err("LOGIN_BROWSER_FAILED", str(e), 502)
