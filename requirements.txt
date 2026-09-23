@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+cryptography
+pydantic-settings
+httpx
+pandas
+numpy
+binaryoptionstoolsv2
