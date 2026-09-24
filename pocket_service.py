@@ -290,16 +290,94 @@ class PocketService:
             from playwright.async_api import async_playwright
         except Exception:
             return _err("PLAYWRIGHT_MISSING",
-                        "Login navigateur indisponible sur ce déploiement. Utilisez votre SSID Pocket Option (DevTools > Network > WS > 42[\"auth\",...]).", 501)
+                        "Playwright n'est pas installé sur ce déploiement.", 501)
         if not email or not password:
             return _err("BAD_CREDENTIALS", "email et password requis.", 400)
+
+        captured = {"ssid": None}
+        found = asyncio.Event()
+
+        def _check_frame(data):
+            if captured["ssid"]:
+                return
+            if isinstance(data, str) and '"auth"' in data and '"isDemo"' in data:
+                captured["ssid"] = data.strip()
+                found.set()
+
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
-                await page.goto("https://pocketoption.com/", timeout=60000)
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                )
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                page = await context.new_page()
+
+                def _on_ws(ws):
+                    ws.on("framereceived", lambda payload: _check_frame(payload))
+                    ws.on("framesent", lambda payload: _check_frame(payload))
+                page.on("websocket", _on_ws)
+
+                await page.goto("https://pocketoption.com/en/login", timeout=60000, wait_until="domcontentloaded")
+
+                email_selectors = ['input[type="email"]', 'input[name="email"]', 'input[placeholder*="mail" i]']
+                pwd_selectors = ['input[type="password"]', 'input[name="password"]']
+
+                filled_email = False
+                for sel in email_selectors:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.count() and await el.is_visible():
+                            await el.fill(email, timeout=5000)
+                            filled_email = True
+                            break
+                    except Exception:
+                        continue
+                if not filled_email:
+                    await browser.close()
+                    return _err("LOGIN_FORM_NOT_FOUND", "Champ email introuvable sur la page de connexion.", 502)
+
+                filled_pwd = False
+                for sel in pwd_selectors:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.count() and await el.is_visible():
+                            await el.fill(password, timeout=5000)
+                            filled_pwd = True
+                            break
+                    except Exception:
+                        continue
+                if not filled_pwd:
+                    await browser.close()
+                    return _err("LOGIN_FORM_NOT_FOUND", "Champ mot de passe introuvable.", 502)
+
+                submitted = False
+                for sel in ['button[type="submit"]', 'button:has-text("Sign in")', 'button:has-text("Login")', 'button:has-text("Se connecter")']:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.count() and await el.is_enabled():
+                            await el.click(timeout=5000)
+                            submitted = True
+                            break
+                    except Exception:
+                        continue
+                if not submitted:
+                    await browser.close()
+                    return _err("LOGIN_FORM_NOT_FOUND", "Bouton de connexion introuvable.", 502)
+
+                try:
+                    await asyncio.wait_for(found.wait(), timeout=40)
+                except asyncio.TimeoutError:
+                    await browser.close()
+                    return _err("LOGIN_TIMEOUT", "Délai dépassé — connexion échouée ou SSID non capturé. Vérifiez vos identifiants ou utilisez le SSID manuel.", 504)
+
+                ssid = captured["ssid"]
                 await browser.close()
-            return _err("LOGIN_BROWSER_UNSTABLE",
-                        "L'automatisation de login est instable. Préférez la connexion par SSID.", 501)
+
+            return await self.connect(ssid)
         except Exception as e:
+            self.last_error = str(e)
             return _err("LOGIN_BROWSER_FAILED", str(e), 502)
