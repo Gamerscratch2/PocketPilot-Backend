@@ -89,8 +89,14 @@ async def connect_ssid(request: Request):
 @app.post("/auth/login-browser")
 async def login_browser(request: Request):
     body = await request.json()
-    return respond(await service.login_browser(body.get("email"), body.get("password"),
-                                               body.get("demo", True)))
+    return respond(await service.login_browser_start(body.get("email"), body.get("password"),
+                                                      body.get("demo", True)))
+
+
+@app.get("/auth/login-browser/status")
+async def login_browser_status(request: Request):
+    q = request.query_params
+    return respond(await service.login_browser_status(q.get("jobId")))
 
 
 @app.post("/auth/validate")
