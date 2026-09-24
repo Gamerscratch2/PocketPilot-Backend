@@ -7,3 +7,4 @@ httpx
 pandas
 numpy
 binaryoptionstoolsv2
+playwright>=1.40.0
