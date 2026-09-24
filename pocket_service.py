@@ -37,8 +37,10 @@ class PocketService:
 
     # ---------- SSID / encryption ----------
     def _parse_is_demo(self, ssid):
-        m = re.search(r'"is_?[Dd]emo"s*:s*(d)', ssid or "")
-        return bool(m and m.group(1) == "1")
+        m = re.search(r'"is_?[Dd]emo"\s*:\s*(\d|true|false)', ssid or "", re.IGNORECASE)
+        if not m:
+            return None
+        return m.group(1).lower() in ("1", "true")
 
     def _load_stored_ssid(self):
         if SESSION_FILE.exists():
@@ -69,13 +71,18 @@ class PocketService:
 
     async def connect(self, ssid):
         async with self._lock:
-            if not ssid or '"auth"' not in (ssid or ""):
-                return _err("BAD_SSID", 'SSID invalide — format attendu: 42["auth",{"session":...,"isDemo":1,...}]')
-            if not self._parse_is_demo(ssid):
+            if not ssid:
+                return _err("BAD_SSID", "SSID vide.")
+            demo_flag = self._parse_is_demo(ssid)
+            if demo_flag is False:
                 return _err("REAL_ACCOUNT_BLOCKED", "Compte réel détecté. PocketPilot n'accepte que les comptes DEMO.", 403)
             try:
                 client = await self._make_client(ssid)
                 bal = await asyncio.wait_for(client.balance(), timeout=25)
+                acct = getattr(client, "account_type", None)
+                if acct is not None and str(acct).lower() in ("real", "0", "false"):
+                    self.connected = False
+                    return _err("REAL_ACCOUNT_BLOCKED", "Compte réel détecté après connexion. DEMO uniquement.", 403)
                 self.client = client
                 self.ssid = ssid
                 self.is_demo = True
