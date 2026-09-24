@@ -271,6 +271,17 @@ class PocketService:
             comps.append({"name": "Playwright", "ok": True, "detail": "installé (login navigateur possible)"})
         except Exception:
             comps.append({"name": "Playwright", "ok": False, "detail": "non installé (login navigateur désactivé — utilisez le SSID)"})
+        # Chromium launch test (real)
+        try:
+            from playwright.async_api import async_playwright as _apw
+            async def _test_launch():
+                async with _apw() as _p:
+                    _b = await _p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"])
+                    await _b.close()
+            await _test_launch()
+            comps.append({"name": "Chromium Launch", "ok": True, "detail": "lancement OK"})
+        except Exception as e:
+            comps.append({"name": "Chromium Launch", "ok": False, "detail": str(e)[:300]})
         # Session
         comps.append({"name": "Session Pocket Option", "ok": self.connected,
                       "detail": "connecté" if self.connected else "non connecté"})
@@ -308,7 +319,7 @@ class PocketService:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"]
                 )
                 try:
                     context = await browser.new_context(
