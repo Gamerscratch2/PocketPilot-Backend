@@ -1,7 +1,6 @@
 import asyncio
 import re
 import time
-import uuid
 from datetime import datetime, timezone
 
 from config import (ok as _ok, err as _err, get_fernet, SESSION_FILE,
@@ -35,7 +34,6 @@ class PocketService:
         self.reconnect_count = 0
         self.last_validated = None
         self._lock = asyncio.Lock()
-        self._login_jobs = {}
 
     # ---------- SSID / encryption ----------
     def _parse_is_demo(self, ssid):
@@ -278,7 +276,7 @@ class PocketService:
             from playwright.async_api import async_playwright as _apw
             async def _test_launch():
                 async with _apw() as _p:
-                    _b = await _p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"])
+                    _b = await _p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--disable-blink-features=AutomationControlled"])
                     await _b.close()
             await _test_launch()
             comps.append({"name": "Chromium Launch", "ok": True, "detail": "lancement OK"})
@@ -297,29 +295,8 @@ class PocketService:
         return _ok({"ready": ready and self.connected, "components": comps,
                     "demoOnly": True, "version": APP_VERSION})
 
-    # ---------- login browser (async job) ----------
-    async def login_browser_start(self, email, password, demo=True):
-        if not email or not password:
-            return _err("BAD_CREDENTIALS", "email et password requis.", 400)
-        job_id = str(uuid.uuid4())
-        self._login_jobs[job_id] = {"status": "running", "result": None}
-        asyncio.create_task(self._login_browser_task(job_id, email, password, demo))
-        return _ok({"jobId": job_id, "status": "running"})
-
-    async def _login_browser_task(self, job_id, email, password, demo):
-        try:
-            result = await self._login_browser_impl(email, password, demo)
-            self._login_jobs[job_id] = {"status": "done", "result": result}
-        except Exception as e:
-            self._login_jobs[job_id] = {"status": "error", "result": str(e)}
-
-    async def login_browser_status(self, job_id):
-        job = self._login_jobs.get(job_id)
-        if not job:
-            return _err("JOB_NOT_FOUND", "Job introuvable.", 404)
-        return _ok({"jobId": job_id, "status": job["status"], "result": job["result"]})
-
-    async def _login_browser_impl(self, email, password, demo=True):
+    # ---------- login browser (optional, Playwright) ----------
+    async def login_browser(self, email, password, demo=True):
         try:
             from playwright.async_api import async_playwright
         except Exception:
@@ -342,7 +319,7 @@ class PocketService:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"]
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--disable-blink-features=AutomationControlled"]
                 )
                 try:
                     context = await browser.new_context(
@@ -356,8 +333,10 @@ class PocketService:
                         ws.on("framesent", lambda payload: _check_frame(payload))
                     page.on("websocket", _on_ws)
 
-                    await page.goto("https://pocketoption.com/en/login", timeout=15000, wait_until="domcontentloaded")
+                    await page.goto("https://pocketoption.com/login", timeout=20000, wait_until="commit")
 
+                    # Wait for the login form to appear
+                    await page.wait_for_selector('input[type="email"]', timeout=15000)
                     email_selectors = ['input[type="email"]', 'input[name="email"]', 'input[placeholder*="mail" i]']
                     pwd_selectors = ['input[type="password"]', 'input[name="password"]']
 
