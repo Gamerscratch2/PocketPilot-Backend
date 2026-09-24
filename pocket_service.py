@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 
 from config import (ok as _ok, err as _err, get_fernet, SESSION_FILE,
@@ -34,6 +35,7 @@ class PocketService:
         self.reconnect_count = 0
         self.last_validated = None
         self._lock = asyncio.Lock()
+        self._login_jobs = {}
 
     # ---------- SSID / encryption ----------
     def _parse_is_demo(self, ssid):
@@ -295,8 +297,29 @@ class PocketService:
         return _ok({"ready": ready and self.connected, "components": comps,
                     "demoOnly": True, "version": APP_VERSION})
 
-    # ---------- login browser (optional, Playwright) ----------
-    async def login_browser(self, email, password, demo=True):
+    # ---------- login browser (async job) ----------
+    async def login_browser_start(self, email, password, demo=True):
+        if not email or not password:
+            return _err("BAD_CREDENTIALS", "email et password requis.", 400)
+        job_id = str(uuid.uuid4())
+        self._login_jobs[job_id] = {"status": "running", "result": None}
+        asyncio.create_task(self._login_browser_task(job_id, email, password, demo))
+        return _ok({"jobId": job_id, "status": "running"})
+
+    async def _login_browser_task(self, job_id, email, password, demo):
+        try:
+            result = await self._login_browser_impl(email, password, demo)
+            self._login_jobs[job_id] = {"status": "done", "result": result}
+        except Exception as e:
+            self._login_jobs[job_id] = {"status": "error", "result": str(e)}
+
+    async def login_browser_status(self, job_id):
+        job = self._login_jobs.get(job_id)
+        if not job:
+            return _err("JOB_NOT_FOUND", "Job introuvable.", 404)
+        return _ok({"jobId": job_id, "status": job["status"], "result": job["result"]})
+
+    async def _login_browser_impl(self, email, password, demo=True):
         try:
             from playwright.async_api import async_playwright
         except Exception:
