@@ -356,10 +356,13 @@ class PocketService:
                         ws.on("framesent", lambda payload: _check_frame(payload))
                     page.on("websocket", _on_ws)
 
-                    await page.goto("https://pocketoption.com/login", timeout=20000, wait_until="commit")
+                    try:
+                        await page.goto("https://pocketoption.com/login", timeout=25000, wait_until="domcontentloaded")
+                    except Exception:
+                        pass  # Le goto peut timeout (anti-bot/redirect) — on vérifie le formulaire ensuite
 
                     # Wait for the login form to appear
-                    await page.wait_for_selector('input[type="email"]', timeout=15000)
+                    await page.wait_for_selector('input[type="email"]', timeout=12000)
                     email_selectors = ['input[type="email"]', 'input[name="email"]', 'input[placeholder*="mail" i]']
                     pwd_selectors = ['input[type="password"]', 'input[name="password"]']
 
